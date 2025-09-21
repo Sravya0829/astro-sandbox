@@ -19,13 +19,13 @@ Build/Deploy: npm, Vercel (incomplete)
 
 
 To run:
-# Install dependencies
+Install dependencies
 npm install
 
-# Run in dev mode
-npm run dev      # http://localhost:3000
+Run in dev mode
+npm run dev (http://localhost:3000)
 
-# Build & Start
+Build & Start
 npm run build
 npm start
 
