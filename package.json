@@ -2,12 +2,13 @@
   "name": "astro-sandbox",
   "version": "0.1.0",
   "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
-  },
+"scripts": {
+  "dev": "next dev",
+  "build": "next build",
+  "start": "next start",
+  "lint": "eslint",
+  "postinstall": "prisma generate"
+},
   "dependencies": {
     "@auth/core": "^0.34.2",
     "@prisma/client": "^6.16.2",
