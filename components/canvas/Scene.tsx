@@ -1,463 +1,91 @@
 "use client";
 
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { OrbitControls, Stars, Html, Line } from "@react-three/drei";
-import React, { useRef, useState, useEffect, useMemo, useCallback } from "react";
+import { Canvas,useFrame,useThree } from "@react-three/fiber";
+import { Html,Line,OrbitControls,Stars } from "@react-three/drei";
+import { useCallback,useEffect,useMemo,useRef,useState } from "react";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
-
-import { PLANETS } from "./planetConfig";
-import type { StarConfig } from "./starConfig";
-import { STARS, STAR_DEFAULT_KEY } from "./starConfig";
-import { useCameraStore } from "./cameraStore";
 import CameraRig from "./CameraRig";
+import { useCameraStore } from "./cameraStore";
+import { usePhysicsWorker } from "./physics/client";
+import { live,usePhysicsStore,type Body } from "./physics/store";
+import { liveOrigin,originBody,scaleDistance,toPhysics,toScene } from "./sceneScale";
+import { analyzeBlackHole } from "@/lib/science/black-hole";
+import { analyzeStar } from "@/lib/science/stellar";
+import { predictTrajectories } from "@/lib/simulation/predict";
+import { SCENE_THEME } from "@/components/canvas/sceneTheme";
 
-// Physics
-import { usePhysicsStore } from "./physics/store";
-import { usePhysicsWorker, type BodyInit } from "./physics/client";
-import { seedFromPlanets } from "./physics/seed";
+function PhysicsStepper({step}:{step:(delta:number)=>void}){useFrame((_,delta)=>step(delta));return null;}
 
+function SelectionCamera(){const selectedId=usePhysicsStore(s=>s.selectedBodyId),focusRequest=usePhysicsStore(s=>s.focusRequest),setFocus=useCameraStore(s=>s.setFocus);useEffect(()=>{const bodies=usePhysicsStore.getState().liveBodies(),body=bodies.find(item=>item.id===selectedId);if(!body)return;setFocus(new THREE.Vector3(...toScene(body.positionAU,liveOrigin(bodies))),Math.max(4,body.renderRadius*7));},[focusRequest,selectedId,setFocus]);return null;}
 
-function PhysicsStepper({ step }: { step: (dt: number) => void }) {
-  useFrame((_, delta) => {
-    step(delta);
-  });
-  return null;
+function Creator({addBody,origin}:{addBody:(body:Body)=>void;origin:[number,number]}){
+  const{camera,gl}=useThree();const[start,setStart]=useState<[number,number]|null>(null);const[pointer,setPointer]=useState<[number,number]|null>(null);
+  const project=useCallback((x:number,y:number):[number,number]|null=>{const rect=gl.domElement.getBoundingClientRect(),ndc=new THREE.Vector2((x-rect.left)/rect.width*2-1,-(y-rect.top)/rect.height*2+1),ray=new THREE.Raycaster(),plane=new THREE.Plane(new THREE.Vector3(0,1,0),0),hit=new THREE.Vector3();ray.setFromCamera(ndc,camera);return ray.ray.intersectPlane(plane,hit)?[hit.x,hit.z]:null;},[camera,gl.domElement]);
+  useEffect(()=>{const move=(event:PointerEvent)=>{const point=project(event.clientX,event.clientY);if(point)setPointer(point);};const click=(event:PointerEvent)=>{if(event.target!==gl.domElement)return;const scenePoint=project(event.clientX,event.clientY);if(!scenePoint)return;const physicsPoint=toPhysics(scenePoint,origin);if(!start){setStart(physicsPoint);return;}const velocity:[number,number]=[(physicsPoint[0]-start[0])*.06,(physicsPoint[1]-start[1])*.06];addBody({id:`custom-${crypto.randomUUID()}`,name:"New planet",category:"planet",massSolar:3e-6,radiusKm:6371,renderRadius:.32,positionAU:start,velocityAUPerDay:velocity,color:"#66ccff"});setStart(null);};window.addEventListener("pointermove",move);window.addEventListener("pointerdown",click);return()=>{window.removeEventListener("pointermove",move);window.removeEventListener("pointerdown",click);};},[addBody,gl.domElement,origin,project,start]);
+  const startScene=start?toScene(start,origin):null;
+  return <>{startScene&&<mesh position={startScene}><sphereGeometry args={[.16,16,16]}/><meshBasicMaterial color="white"/></mesh>}{startScene&&pointer&&<Line points={[new THREE.Vector3(...startScene),new THREE.Vector3(pointer[0],0,pointer[1])]} color="#ffffff" lineWidth={1}/>}<Html fullscreen style={{pointerEvents:"none"}}><div className="creator-hint">{start?"Move the pointer, then click to set velocity":"Click in the scene to place the planet"}</div></Html></>;
 }
 
-const AU = 10;
+function OrbitGuide({body,origin}:{body:Body;origin:[number,number]}){const[radius]=useState(()=>scaleDistance(Math.hypot(body.positionAU[0]-origin[0],body.positionAU[1]-origin[1])));const points=useMemo(()=>Array.from({length:129},(_,index)=>{const angle=index/128*Math.PI*2;return new THREE.Vector3(Math.cos(angle)*radius,0,Math.sin(angle)*radius);}),[radius]);return radius>.2?<Line points={points} color={SCENE_THEME.orbitGuide} lineWidth={.6} transparent opacity={.55}/>:null;}
 
-// --- Log-distance scaling (AU -> scene units) ---
-const SCALE_K = 12;
-const SCALE_R0 = 0.4;
+// Trail and velocity vector redraw every frame from the live state, without React re-renders.
+function useLiveLine(capacity:number,color:string,opacity:number){
+  return useMemo(()=>{const geometry=new THREE.BufferGeometry();geometry.setAttribute("position",new THREE.BufferAttribute(new Float32Array(capacity*3),3));geometry.setDrawRange(0,0);return new THREE.Line(geometry,new THREE.LineBasicMaterial({color,transparent:true,opacity}));},[capacity,color,opacity]);
+}
+function writeLine(line:THREE.Line,points:Array<[number,number,number]>){const attribute=line.geometry.getAttribute("position") as THREE.BufferAttribute,count=Math.min(points.length,attribute.count);for(let index=0;index<count;index++)attribute.setXYZ(index,...points[index]);attribute.needsUpdate=true;line.geometry.setDrawRange(0,count);line.geometry.computeBoundingSphere();}
 
-function scaleRadiusAU(rAU: number) {
-  return SCALE_K * Math.log(1 + rAU / SCALE_R0);
-}
-function invScaleRadius(sceneR: number) {
-  // invert y = K * ln(1 + r/R0)  →  r = R0 * (e^(y/K) - 1)
-  return SCALE_R0 * (Math.exp(sceneR / SCALE_K) - 1);
-}
-function toSceneFromAU(posAU: [number, number], starAU: [number, number]): [number, number, number] {
-  const dx = posAU[0] - starAU[0];
-  const dy = posAU[1] - starAU[1];
-  const r = Math.hypot(dx, dy);
-  if (r === 0) return [0, 0, 0];
-  const s = scaleRadiusAU(r);
-  const ux = dx / r, uy = dy / r;
-  return [ux * s, 0, uy * s];
-}
-function toAUFromScene(sceneXZ: [number, number], starAU: [number, number]): [number, number] {
-  const [x, z] = sceneXZ;
-  const rS = Math.hypot(x, z);
-  if (rS === 0) return [starAU[0], starAU[1]];
-  const rAU = invScaleRadius(rS);
-  const ux = x / rS, uz = z / rS;
-  return [starAU[0] + ux * rAU, starAU[1] + uz * rAU];
+function Trail({id,color}:{id:string;color:string}){
+  const line=useLiveLine(721,color,.42);useEffect(()=>()=>{line.geometry.dispose();(line.material as THREE.Material).dispose();},[line]);
+  useFrame(()=>{const origin=liveOrigin(),points=(live.trails.get(id)??[]).map(point=>toScene(point,origin)),current=live.positions.get(id);if(current)points.push(toScene(current,origin));writeLine(line,points);});
+  return <primitive object={line}/>;
 }
 
+function PredictedTrail({points,origin,color}:{points:Array<[number,number]>;origin:[number,number];color:string}){const scenePoints=useMemo(()=>points.map(point=>new THREE.Vector3(...toScene(point,origin))),[origin,points]);return scenePoints.length>1?<Line points={scenePoints} color={color} lineWidth={.7} dashed dashSize={.35} gapSize={.24} transparent opacity={.32}/>:null;}
 
-function CreatorGizmo({ addBody }: { addBody: (b: BodyInit) => void }) {
-  const { camera, gl } = useThree();
-
-  // Current star position in AU (index 0). If missing, use [0,0].
-  const starAU = usePhysicsStore((s) => s.bodies[0]?.pos ?? ([0, 0] as [number, number]));
-
-  // First click stores AU position; second click sets velocity
-  const [placing, setPlacing] = useState<null | { posAU: [number, number] }>(null);
-  // Latest pointer position in SCENE (x,z) for aiming the velocity arrow
-  const [pointerScene, setPointerScene] = useState<[number, number] | null>(null);
-
-  // Raycast the mouse to the XZ plane (y=0), return scene [x,z]
-  const getSceneXZ = useCallback(
-    (clientX: number, clientY: number): [number, number] | null => {
-      const rect = gl.domElement.getBoundingClientRect();
-      const ndc = new THREE.Vector2(
-        ((clientX - rect.left) / rect.width) * 2 - 1,
-        -((clientY - rect.top) / rect.height) * 2 + 1
-      );
-      const ray = new THREE.Raycaster();
-      ray.setFromCamera(ndc, camera);
-      const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0); // y=0
-      const hit = new THREE.Vector3();
-      if (ray.ray.intersectPlane(plane, hit)) {
-        return [hit.x, hit.z];
-      }
-      return null;
-    },
-    [gl.domElement, camera]
-  );
-
-  // Mouse move / click handlers
-  useEffect(() => {
-    function onMove(e: MouseEvent) {
-      const p = getSceneXZ(e.clientX, e.clientY);
-      if (p) setPointerScene(p);
-    }
-
-    function onClick(e: MouseEvent) {
-      const p = getSceneXZ(e.clientX, e.clientY);
-      if (!p) return;
-
-      if (!placing) {
-        // First click: choose spawn position (convert scene → AU using inverse log scale)
-        const posAU = toAUFromScene(p, starAU);
-        setPlacing({ posAU });
-      } else {
-        // Second click: choose initial velocity based on drag direction
-        if (!pointerScene) return;
-
-        const p0 = placing.posAU;                         // AU
-        const p1AU = toAUFromScene(pointerScene, starAU); // AU
-
-        // Heuristic: convert displacement to AU/day
-        const SCALE_V = 0.06; // ↓ reduce if new planets fly off too fast
-        const vAU: [number, number] = [
-          (p1AU[0] - p0[0]) * SCALE_V,
-          (p1AU[1] - p0[1]) * SCALE_V,
-        ];
-
-        // Send to worker + store (includes visual props)
-        addBody({
-          massSolar: 0,                 // massless test particle (doesn’t tug others)
-          pos: p0,
-          vel: vAU,
-          name: "Custom",
-          color: "#66ccff",
-          radiusScene: 0.28,
-        });
-
-        setPlacing(null);
-      }
-    }
-
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("click", onClick);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("click", onClick);
-    };
-  }, [getSceneXZ, placing, pointerScene, starAU, addBody]);
-
-  // Preview marker (scene coords)
-  const previewPosScene = useMemo(
-    () => (placing ? toSceneFromAU(placing.posAU, starAU) : null),
-    [placing, starAU]
-  );
-
-  // Preview velocity arrow end (scene coords)
-  const previewVelEndScene = useMemo(() => {
-    if (!placing || !pointerScene) return null;
-    const p1AU = toAUFromScene(pointerScene, starAU);
-
-    // Longer line so it’s easy to see in the scene
-    const SCALE_V_LINE = 2.0;
-    const vx = (p1AU[0] - placing.posAU[0]) * SCALE_V_LINE;
-    const vy = (p1AU[1] - placing.posAU[1]) * SCALE_V_LINE;
-    const endAU: [number, number] = [placing.posAU[0] + vx, placing.posAU[1] + vy];
-    return toSceneFromAU(endAU, starAU);
-  }, [placing, pointerScene, starAU]);
-
-  useEffect(() => {
-    const prev = document.body.style.cursor;
-    document.body.style.cursor = "crosshair";
-    return () => { document.body.style.cursor = prev; };
-  }, []);
-
-  return (
-    <>
-      <Html position={[-9999, -9999, 0]} transform={false}>
-        <div style={{
-          position: "fixed", top: 12, left: 12,
-          background: "rgba(0,0,0,0.6)", color: "#fff",
-          padding: "6px 8px", borderRadius: 6, fontSize: 12,
-          pointerEvents: "none", zIndex: 1000
-        }}>
-          Add planet: click to place, move mouse, click to set velocity
-        </div>
-      </Html>
-
-      {/* Spawn point preview */}
-      {previewPosScene && (
-        <mesh position={previewPosScene}>
-          <sphereGeometry args={[0.15, 16, 16]} />
-          <meshBasicMaterial color="white" />
-        </mesh>
-      )}
-
-      {/* Velocity preview arrow */}
-      {previewPosScene && previewVelEndScene && (
-        <Line
-          points={[
-            new THREE.Vector3(...previewPosScene),
-            new THREE.Vector3(...previewVelEndScene),
-          ]}
-          lineWidth={1}
-          color="#ffffff"
-          transparent
-          opacity={0.9}
-        />
-      )}
-    </>
-  );
+function VelocityVector({id}:{id:string}){
+  const line=useLiveLine(2,SCENE_THEME.velocity,.75);useEffect(()=>()=>{line.geometry.dispose();(line.material as THREE.Material).dispose();},[line]);
+  useFrame(()=>{const position=live.positions.get(id),velocity=live.velocities.get(id);if(!position||!velocity)return;const origin=liveOrigin();writeLine(line,[toScene(position,origin),toScene([position[0]+velocity[0]*25,position[1]+velocity[1]*25],origin)]);});
+  return <primitive object={line}/>;
 }
 
+function BlackHoleVisual({radius,selected}:{radius:number;selected:boolean}){const disk=useRef<THREE.Mesh>(null!);useFrame((_,delta)=>{if(disk.current)disk.current.rotation.z+=delta*.16;});return <>
+  <mesh ref={disk} rotation={[Math.PI/2.4,0,0]}><ringGeometry args={[radius*1.28,radius*2.85,128,3]}/><meshBasicMaterial color="#ff9b4a" transparent opacity={.68} side={THREE.DoubleSide} blending={THREE.AdditiveBlending}/></mesh>
+  <mesh rotation={[Math.PI/2,0,0]}><torusGeometry args={[radius*1.5,radius*.025,10,100]}/><meshBasicMaterial color={SCENE_THEME.photonRing} transparent opacity={selected?.9:.38}/></mesh>
+  <mesh><sphereGeometry args={[radius*2.1,40,40]}/><meshBasicMaterial color={SCENE_THEME.horizonHalo} transparent opacity={selected?.055:.02} side={THREE.BackSide}/></mesh>
+  {selected&&<Html transform position={[radius*2.2,radius*.7,0]} distanceFactor={8} style={{pointerEvents:"none"}}><div className="scene-science-label"><strong>Photon sphere</strong><span>1.5 × event horizon</span></div></Html>}
+  </>}
 
+function SceneScienceOverlay({body}:{body:Body}){if(body.category==="star"){const analysis=analyzeStar(body.massSolar,body.ageGyr,body.metallicity);return <Html transform position={[0,-body.renderRadius*1.5,0]} distanceFactor={8} style={{pointerEvents:"none"}}><div className="scene-science-label"><strong>{analysis.stage}</strong><span>Next: {analysis.nextStage}</span></div></Html>;}if(body.category==="blackHole"){const analysis=analyzeBlackHole(body.massSolar);return <Html transform position={[0,-body.renderRadius*1.65,0]} distanceFactor={8} style={{pointerEvents:"none"}}><div className="scene-science-label warm"><strong>Event horizon</strong><span>{analysis.schwarzschildRadiusKm.toFixed(1)} km calculated</span></div></Html>;}return null;}
 
-/* ---------------- SUN ---------------- */
-function Sun({
-  name,
-  radius,
-  type,
-  color,
-  emissive,
-  emissiveIntensity,
-  massSolar,
-}: {
-  name: string;
-  radius: number;
-  type: string;
-  color: string;
-  emissive: string;
-  emissiveIntensity: number;
-  massSolar: number;
-}) {
-  const meshRef = useRef<THREE.Object3D>(null!);
-  const [hovered, setHovered] = useState(false);
-  const setFocus = useCameraStore((s) => s.setFocus);
-
-  useEffect(() => {
-    document.body.style.cursor = hovered ? "pointer" : "auto";
-    return () => { document.body.style.cursor = "auto"; };
-  }, [hovered]);
-
-  const material = useMemo(
-    () => new THREE.MeshStandardMaterial({
-      color: new THREE.Color(color),
-      emissive: new THREE.Color(emissive),
-      emissiveIntensity,
-      roughness: 0.6,
-    }),
-    [color, emissive, emissiveIntensity]
-  );
-
-  return (
-    <group name={name} position={[0, 0, 0]}>
-      <mesh
-        ref={meshRef as React.Ref<THREE.Object3D>}
-        onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
-        onPointerOut={(e) => { e.stopPropagation(); setHovered(false); }}
-        onClick={(e) => {
-          e.stopPropagation();
-          const wp = new THREE.Vector3();
-          meshRef.current.getWorldPosition(wp);
-          setFocus(wp, Math.max(4, radius * 6));
-        }}
-      >
-        <sphereGeometry args={[radius, 48, 48]} />
-        <primitive object={material} attach="material" />
-      </mesh>
-
-      <Html transform position={[0, radius + 0.4, 0]} occlude={[meshRef]} distanceFactor={8} style={{ pointerEvents: "none" }}>
-        <div style={{ padding: "2px 6px", fontSize: "12px", borderRadius: 6, background: "rgba(0,0,0,0.5)", color: "white", whiteSpace: "nowrap" }}>
-          {name}
-        </div>
-      </Html>
-
-      {hovered && (
-        <Html transform position={[0, radius + 1.0, 0]} occlude={[meshRef]} distanceFactor={8} style={{ pointerEvents: "none" }}>
-          <div style={{ padding: "6px 8px", fontSize: "12px", borderRadius: 8, background: "rgba(20,20,20,0.75)", color: "white", boxShadow: "0 2px 8px rgba(0,0,0,0.35)", whiteSpace: "nowrap", border: "1px solid rgba(255,255,255,0.15)" }}>
-            <strong style={{ marginRight: 6 }}>{name}</strong>
-            <span>• Type: {type}</span>{" "}
-            <span>• Mass ≈ {massSolar} M☉</span>
-          </div>
-        </Html>
-      )}
-    </group>
-  );
+function CelestialMesh({body,origin}:{body:Body;origin:[number,number]}){
+  const group=useRef<THREE.Group>(null!);const select=usePhysicsStore(s=>s.selectBody),selected=usePhysicsStore(s=>s.selectedBodyId===body.id);const position=toScene(body.positionAU,origin);
+  useFrame(()=>{const current=live.positions.get(body.id);if(current&&group.current)group.current.position.set(...toScene(current,liveOrigin()));});const isStar=body.category==="star",isBlackHole=body.category==="blackHole";
+  const stellar=isStar?analyzeStar(body.massSolar,body.ageGyr,body.metallicity):null,displayColor=stellar?.visualColor??body.color,displayRadius=body.renderRadius*(stellar?.visualRadiusMultiplier??1);
+  const material=useMemo(()=>new THREE.MeshStandardMaterial({color:displayColor,emissive:isStar?displayColor:"#000000",emissiveIntensity:isStar?1.15:0,roughness:.68,metalness:.05}),[displayColor,isStar]);
+  return <group ref={group} position={position}>
+    {isStar&&<pointLight color={displayColor} intensity={2.2} distance={90}/>} {isBlackHole&&<BlackHoleVisual radius={displayRadius} selected={selected}/>}
+    <mesh onClick={(event)=>{event.stopPropagation();select(body.id);}} onPointerOver={()=>{document.body.style.cursor="pointer";}} onPointerOut={()=>{document.body.style.cursor="auto";}}>
+      <sphereGeometry args={[displayRadius,40,40]}/><primitive object={material} attach="material"/>
+    </mesh>
+    {selected&&!isBlackHole&&<mesh><sphereGeometry args={[displayRadius*1.16,32,32]}/><meshBasicMaterial color={SCENE_THEME.selection} transparent opacity={.16} side={THREE.BackSide}/></mesh>}
+    <Html transform position={[0,displayRadius+.3,0]} distanceFactor={8} style={{pointerEvents:"none"}}><div className={`body-label ${selected?"selected":""}`}>{body.name}</div></Html>
+    {selected&&<SceneScienceOverlay body={body}/>}
+  </group>;
 }
 
-/* --------------- ORBIT RING --------------- */
-function OrbitRing({ radiusScene }: { radiusScene: number }) {
-  const segments = 128;
-  const geom = useMemo(() => {
-    const pts: THREE.Vector3[] = [];
-    for (let i = 0; i <= segments; i++) {
-      const a = (i / segments) * Math.PI * 2;
-      pts.push(new THREE.Vector3(Math.cos(a) * radiusScene, 0, Math.sin(a) * radiusScene));
-    }
-    const g = new THREE.BufferGeometry();
-    g.setFromPoints(pts);
-    return g;
-  }, [radiusScene]);
-
-  return (
-    <line>
-      <primitive object={geom} attach="geometry" />
-      <lineBasicMaterial color="#444" />
-    </line>
-  );
-}
-
-/* --------------- PLANET (physics position) --------------- */
-type PlanetProps = {
-  name: string;
-  radius: number;
-  posAU: [number, number];
-  tilt?: number;
-  color?: string;
-};
-
-function Planet({ name, radius, posAU, tilt = 0, color = "#88aaff" }: PlanetProps) {
-  const groupRef = useRef<THREE.Object3D>(null!);
-  const meshRef = useRef<THREE.Object3D>(null!);
-  const [hovered, setHovered] = useState(false);
-  const setFocus = useCameraStore((s) => s.setFocus);
-
-  // Get the star's current AU position from the physics store (index 0)
-  const starAU = usePhysicsStore((s) => s.bodies[0]?.pos ?? ([0, 0] as [number, number]));
-
-  const posScene = useMemo(() => toSceneFromAU(posAU, starAU), [posAU, starAU]);
-
-  useEffect(() => {
-    document.body.style.cursor = hovered ? "pointer" : "auto";
-    return () => { document.body.style.cursor = "auto"; };
-  }, [hovered]);
-
-  const material = useMemo(
-    () => new THREE.MeshStandardMaterial({ color: new THREE.Color(color), roughness: 0.7, metalness: 0.1 }),
-    [color]
-  );
-
-  return (
-    <group ref={groupRef as React.Ref<THREE.Object3D>} name={name} position={posScene}>
-      <mesh
-        ref={meshRef as React.Ref<THREE.Object3D>}
-        onPointerOver={(e) => { e.stopPropagation(); setHovered(true); }}
-        onPointerOut={(e) => { e.stopPropagation(); setHovered(false); }}
-        onClick={(e) => {
-          e.stopPropagation();
-          const wp = new THREE.Vector3();
-          groupRef.current.getWorldPosition(wp);
-          setFocus(wp, Math.max(4, radius * 8));
-        }}
-      >
-        <sphereGeometry args={[radius, 32, 32]} />
-        <primitive object={material} attach="material" />
-      </mesh>
-
-      <Html transform position={[0, radius + 0.25, 0]} occlude={[meshRef]} distanceFactor={8} style={{ pointerEvents: "none" }}>
-        <div style={{ padding: "2px 6px", fontSize: "12px", borderRadius: 6, background: "rgba(0,0,0,0.5)", color: "white", whiteSpace: "nowrap" }}>
-          {name}
-        </div>
-      </Html>
-
-      {hovered && (
-        <Html transform position={[0, radius + 0.9, 0]} occlude={[meshRef]} distanceFactor={8} style={{ pointerEvents: "none" }}>
-          <div style={{ padding: "6px 8px", fontSize: "12px", borderRadius: 8, background: "rgba(20,20,20,0.75)", color: "white", boxShadow: "0 2px 8px rgba(0,0,0,0.35)", whiteSpace: "nowrap", border: "1px solid rgba(255,255,255,0.15)" }}>
-            <strong style={{ marginRight: 6 }}>{name}</strong>
-            <span>• r ≈ {Math.hypot(posAU[0] - starAU[0], posAU[1] - starAU[1]).toFixed(2)} AU</span>
-          </div>
-        </Html>
-      )}
-    </group>
-  );
-}
-
-/* ---------------- SCENE ROOT ---------------- */
-export default function Scene({
-  simSpeed = 30,
-  star = STARS[STAR_DEFAULT_KEY],
-  mutualGravity = true,
-  creatorMode = false,
-}: {
-  simSpeed?: number;
-  star?: StarConfig;
-  mutualGravity?: boolean;
-  creatorMode?: boolean;
-}) {
-  const controlsRef = useRef<OrbitControlsImpl>(null);
-
-  // Build initial physics bodies from the selected star + planet config
-  const initialBodies = useMemo(() => {
-    return seedFromPlanets({
-      starName: star.name,
-      starMass: star.massSolar,
-      starRadiusScene: star.radiusScene,
-      starColor: star.color,
-      planets: PLANETS.map((p) => ({
-        name: p.name,
-        aAU: p.aAU,
-        periodDays: p.periodDays,
-        radius: p.radius,
-        color: p.color,
-      })),
-      mutualGravity, // re-seeds worker when toggled
-    });
-  }, [star, mutualGravity]);
-
-  // ✅ Call the physics hook at the top level (not inside useEffect)
-  const { step, addBody } = usePhysicsWorker({
-    initialBodies,
-    simSpeed, // days per real second (0 = paused)
-  });
-
-  // Read live bodies from the store (index 0 is the star in AU space)
-  const bodies = usePhysicsStore((s) => s.bodies);
-
-  // Small helper that runs inside the Canvas so useFrame is legal
-  function PhysicsStepper({ step }: { step: (dt: number) => void }) {
-    useFrame((_, delta) => step(delta));
-    return null;
-  }
-
-  return (
-    <Canvas camera={{ position: [0, 6, 26], fov: 60 }} dpr={[1, 2]}>
-      {/* Drive physics each frame */}
-      <PhysicsStepper step={step} />
-
-      {/* Optional creator overlay */}
-      {creatorMode && <CreatorGizmo addBody={addBody} />}
-
-      {/* Background + lights */}
-      <Stars radius={200} depth={50} count={2000} factor={4} fade />
-      <ambientLight intensity={0.25} />
-      <directionalLight position={[3, 5, 2]} intensity={1.0} />
-
-      {/* Sun rendered at scene origin (we're using log-distance visualization) */}
-      <Sun
-        name={star.name}
-        type={star.type}
-        radius={star.radiusScene}
-        color={star.color}
-        emissive={star.emissive}
-        emissiveIntensity={star.emissiveIntensity}
-        massSolar={star.massSolar}
-      />
-
-      {/* Reference orbit rings – use the same scaling as planets */}
-      {PLANETS.map((p) => (
-        <OrbitRing key={`ring:${p.name}`} radiusScene={scaleRadiusAU(p.aAU)} />
-      ))}
-
-      {/* Render planets at physics positions (skip index 0 = star) */}
-      {bodies.slice(1).map((b) => (
-        <Planet
-          key={b.id}
-          name={b.name}
-          radius={b.radiusScene}
-          posAU={b.pos}
-          color={b.color}
-        />
-      ))}
-
-      {/* Controls + tween rig */}
-      <OrbitControls
-        ref={controlsRef as React.Ref<OrbitControlsImpl>}
-        enableDamping
-        enabled={!creatorMode}   // ← important
-      />
-      <CameraRig controls={controlsRef.current} />
-    </Canvas>
-  );
+export default function Scene({simSpeed=30,initialBodies,creatorMode=false,showTrails=true,showPredictions=true,showVelocity=false,showGrid=false,collisions="merge",onController}:{simSpeed?:number;initialBodies:Body[];creatorMode?:boolean;showTrails?:boolean;showPredictions?:boolean;showVelocity?:boolean;showGrid?:boolean;collisions?:"merge"|"none";onController?:(controller:{addBody:(body:Body)=>void;updateBody:(id:string,patch:Partial<Body>)=>void;removeBody:(id:string)=>void;reset:()=>void})=>void}){
+  const controlsRef=useRef<OrbitControlsImpl>(null),select=usePhysicsStore(s=>s.selectBody),bodies=usePhysicsStore(s=>s.bodies),trajectoryRevision=usePhysicsStore(s=>s.trajectoryRevision);const predicted=useMemo(()=>{void trajectoryRevision;return predictTrajectories(usePhysicsStore.getState().bodies);},[trajectoryRevision]);const{step,addBody,updateBody,removeBody,reset}=usePhysicsWorker({initialBodies,simSpeed,collisions});const setHome=useCameraStore(s=>s.setHome);
+  useEffect(()=>{setHome();},[initialBodies,setHome]);
+  useEffect(()=>{onController?.({addBody,updateBody,removeBody,reset});},[addBody,onController,removeBody,reset,updateBody]);
+  const primary=originBody(bodies),origin=primary?.positionAU??[0,0];
+  return <Canvas camera={{position:[0,6,26],fov:60}} dpr={[1,2]} onPointerMissed={()=>select(null)}>
+    <color attach="background" args={[SCENE_THEME.background]}/><fog attach="fog" args={[SCENE_THEME.background,55,150]}/><PhysicsStepper step={step}/><SelectionCamera/>{creatorMode&&<Creator addBody={addBody} origin={origin}/>}<Stars radius={180} depth={60} count={2600} factor={3} fade/><ambientLight intensity={.18}/><directionalLight position={[3,5,2]} intensity={.7}/>{showGrid&&<gridHelper args={[120,60,SCENE_THEME.gridMajor,SCENE_THEME.gridMinor]}/>}
+    {bodies.filter(body=>body.id!==primary?.id).map(body=><OrbitGuide key={`orbit-${body.id}`} body={body} origin={origin}/>)}
+    {showTrails&&bodies.map(body=><Trail key={`trail-${body.id}`} id={body.id} color={body.color}/>)}
+    {showPredictions&&bodies.map(body=><PredictedTrail key={`prediction-${body.id}`} points={predicted[body.id]??[]} origin={origin} color={body.color}/>)}
+    {showVelocity&&bodies.map(body=><VelocityVector key={`velocity-${body.id}`} id={body.id}/>)}
+    {bodies.map(body=><CelestialMesh key={body.id} body={body} origin={origin}/>) }
+    <OrbitControls ref={controlsRef as React.Ref<OrbitControlsImpl>} enableDamping dampingFactor={.08} enablePan enableRotate enableZoom zoomToCursor minDistance={2.5} maxDistance={150} screenSpacePanning enabled={!creatorMode}/><CameraRig controls={controlsRef.current}/>
+  </Canvas>;
 }

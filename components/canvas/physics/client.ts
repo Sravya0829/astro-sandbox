@@ -1,123 +1,46 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
-import { usePhysicsStore, type Body } from "./store";
-import type { WorkerStateMsg } from "./physics.worker"; // outbound type from the worker
+import { useCallback,useEffect,useRef } from "react";
+import { usePhysicsStore,type Body } from "./store";
+import type { WorkerBody,WorkerMsg,WorkerStateMsg } from "./physics.worker";
 
-// Next.js/Webpack-friendly worker constructor
-const WorkerCtor = () =>
-  new Worker(new URL("./physics.worker.ts", import.meta.url));
+const MAX_FRAME_SECONDS=.1,SUBSTEPS_PER_DAY=24;
+const createWorker=()=>new Worker(new URL("./physics.worker.ts",import.meta.url));
+const workerBody=(body:Body):WorkerBody=>({id:body.id,category:body.category,massSolar:body.massSolar,radiusKm:body.radiusKm,renderRadius:body.renderRadius,positionAU:body.positionAU,velocityAUPerDay:body.velocityAUPerDay});
 
-/** Inputs to add a new body at runtime. Includes both physics + visual props. */
-export type BodyInit = {
-  // physics (worker cares about these)
-  massSolar: number;                 // in solar masses
-  pos: [number, number];             // AU (x, y) on the orbital plane
-  vel: [number, number];             // AU/day (vx, vy)
-  // visual (UI/store only)
-  name?: string;
-  radiusScene?: number;              // mesh radius in scene units
-  color?: string;                    // mesh color
-};
+export function usePhysicsWorker({initialBodies,simSpeed,G=.00029591220828559,softening2=1e-6,collisions="merge"}:{initialBodies:Body[];simSpeed:number;G?:number;softening2?:number;collisions?:"merge"|"none"}){
+  const workerRef=useRef<Worker|null>(null),collisionsRef=useRef(collisions);
+  // revision: bumped on every structural change; snapshots from older revisions are stale and dropped.
+  // stepInFlight/pendingSeconds: at most one step outstanding, so a slow worker can't build a backlog.
+  const revisionRef=useRef(0),stepInFlightRef=useRef(false),pendingSecondsRef=useRef(0);
+  const setBodies=usePhysicsStore(s=>s.setBodies),applySnapshot=usePhysicsStore(s=>s.applySnapshot);
+  const post=useCallback((message:WorkerMsg)=>workerRef.current?.postMessage(message),[]);
+  const nextRevision=()=>++revisionRef.current;
 
-export function usePhysicsWorker({
-  initialBodies,
-  G = 0.00029591220828559,           // AU^3 / (M☉ * day^2)
-  softening2 = 1e-6,                 // (0.001 AU)^2 softening
-  simSpeed,
-}: {
-  initialBodies: Body[];
-  G?: number;
-  softening2?: number;
-  simSpeed: number;                  // days per real-time second; 0 = paused
-}) {
-  const setBodies = usePhysicsStore((s) => s.setBodies);
-  const updatePositions = usePhysicsStore((s) => s.updatePositions);
-  const workerRef = useRef<Worker | null>(null);
-
-  // Spawn/initialize the worker whenever the scenario changes
-  useEffect(() => {
-    const w = WorkerCtor();
-    workerRef.current = w;
-
-    // Initialize UI store bodies (visuals)
-    setBodies(initialBodies);
-
-    // Wire state updates from worker → store positions (by index)
-    w.onmessage = (ev: MessageEvent<WorkerStateMsg>) => {
-      if (ev.data?.type === "state" && ev.data.pos) {
-        updatePositions(ev.data.pos);
-      }
+  useEffect(()=>{
+    const worker=createWorker();workerRef.current=worker;stepInFlightRef.current=false;pendingSecondsRef.current=0;setBodies(initialBodies,true);
+    worker.onmessage=(event:MessageEvent<WorkerStateMsg>)=>{
+      const data=event.data;if(data.type!=="state")return;
+      if(data.source==="step")stepInFlightRef.current=false;
+      if(data.revision<revisionRef.current)return;
+      applySnapshot(data.bodies,data.elapsedDays,data.events);
     };
+    worker.postMessage({type:"init",revision:nextRevision(),G,softening2,collisions:collisionsRef.current,bodies:initialBodies.map(workerBody)} satisfies WorkerMsg);
+    return()=>{worker.terminate();workerRef.current=null;};
+  },[initialBodies,G,softening2,setBodies,applySnapshot]);
+  useEffect(()=>{collisionsRef.current=collisions;post({type:"configure",collisions});},[collisions,post]);
 
-    // Send initial physics bodies to the worker
-    w.postMessage({
-      type: "init",
-      G,
-      softening2,
-      bodies: initialBodies.map((b) => ({
-        massSolar: b.massSolar,
-        pos: b.pos,
-        vel: b.vel,
-      })),
-    });
-
-    // Cleanup worker on unmount or when initial bodies change
-    return () => {
-      w.terminate();
-      workerRef.current = null;
-    };
-    // Using JSON.stringify to avoid deep deps noise; include G/softening2 in case you tweak them
-  }, [initialBodies, G, softening2, setBodies, updatePositions]);
-
-  /** Advance physics by render delta (keeps substeps ≤ 1 hour for stability). */
-  const step = useCallback(
-    (dtSeconds: number) => {
-      const w = workerRef.current;
-      if (!w || simSpeed <= 0) return;
-
-      const dtDays = dtSeconds * simSpeed;
-
-      // Cap per-substep to ~1 hour of simulated time
-      const maxStepDays = 1 / 24;
-      const substeps = Math.max(1, Math.ceil(Math.abs(dtDays) / maxStepDays));
-
-      w.postMessage({ type: "step", dtDays, substeps });
-    },
-    [simSpeed]
-  );
-
-  /**
-   * Add a new body at runtime.
-   * Posts physics data to the worker and appends a visual entry to the UI store.
-   */
-  const addBody = useCallback((body: BodyInit) => {
-    const w = workerRef.current;
-    if (!w) return;
-
-    // 1) Tell the worker about the new physics body
-    w.postMessage({
-      type: "add",
-      body: {
-        massSolar: body.massSolar,
-        pos: body.pos,
-        vel: body.vel,
-      },
-    });
-
-    // 2) Append a matching visual body to the UI store (so the mesh renders)
-    const current = usePhysicsStore.getState().bodies;
-    const visual: Body = {
-      id: `planet:custom-${Date.now()}`,
-      name: body.name ?? "Custom",
-      massSolar: body.massSolar,
-      radiusScene: body.radiusScene ?? 0.28,
-      color: body.color ?? "#66ccff",
-      pos: body.pos,
-      vel: body.vel,
-    };
-    usePhysicsStore.getState().setBodies([...current, visual]);
-  }, []);
-
-  return { step, addBody };
+  const step=useCallback((seconds:number)=>{
+    if(!workerRef.current)return;
+    if(simSpeed<=0){pendingSecondsRef.current=0;return;}
+    pendingSecondsRef.current+=Math.min(seconds,MAX_FRAME_SECONDS);
+    if(stepInFlightRef.current)return;
+    const dtDays=pendingSecondsRef.current*simSpeed;pendingSecondsRef.current=0;stepInFlightRef.current=true;
+    post({type:"step",dtDays,substeps:Math.max(1,Math.ceil(Math.abs(dtDays)*SUBSTEPS_PER_DAY))});
+  },[post,simSpeed]);
+  const addBody=useCallback((body:Body)=>{usePhysicsStore.getState().addBody(body);post({type:"add",revision:nextRevision(),body:workerBody(body)});},[post]);
+  const updateBody=useCallback((id:string,patch:Partial<Body>)=>{const current=usePhysicsStore.getState().bodies.find(body=>body.id===id);if(!current)return;const next={...current,...patch,id};usePhysicsStore.getState().updateBody(id,patch);post({type:"update",revision:nextRevision(),id,body:workerBody(next)});},[post]);
+  const removeBody=useCallback((id:string)=>{usePhysicsStore.getState().removeBody(id);post({type:"remove",revision:nextRevision(),id});},[post]);
+  const reset=useCallback(()=>{const bodies=usePhysicsStore.getState().initialBodies;usePhysicsStore.getState().restoreInitial();post({type:"reset",revision:nextRevision(),bodies:bodies.map(workerBody)});},[post]);
+  return{step,addBody,updateBody,removeBody,reset};
 }

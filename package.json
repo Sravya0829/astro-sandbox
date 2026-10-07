@@ -7,6 +7,7 @@
   "build": "next build",
   "start": "next start",
   "lint": "eslint",
+  "test:science": "node --experimental-strip-types --test tests/science.test.mjs",
   "postinstall": "prisma generate"
 },
   "dependencies": {

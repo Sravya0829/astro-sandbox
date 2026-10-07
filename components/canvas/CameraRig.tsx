@@ -5,6 +5,8 @@ import { useThree, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { useCameraStore } from "./cameraStore";
+import { usePhysicsStore } from "./physics/store";
+import { liveScenePosition } from "./sceneScale";
 
 type Props = {
   /** Pass the OrbitControls instance (e.g., controlsRef.current) */
@@ -23,7 +25,15 @@ export default function CameraRig({ controls }: Props) {
     endPos: new THREE.Vector3(),           // camera end
     startTarget: new THREE.Vector3(),      // controls target start
     endTarget: new THREE.Vector3(),        // controls target end
+    direction: new THREE.Vector3(),        // camera offset direction from the target
+    distance: 0,                           // camera distance from the target
+    followId: null as string | null,       // body the tween is chasing (it keeps moving)
   });
+
+  // While a body is selected the camera follows it: each frame the camera and orbit target move by
+  // however far the body moved, so the user's own orbit/zoom around it is preserved. Clicking empty
+  // space clears the selection and the camera stays where it is.
+  const followRef = useRef<{ id: string | null; last: THREE.Vector3 | null }>({ id: null, last: null });
 
   // Only subscribe to the "signal" that indicates a new focus/home
   const requestId = useCameraStore((s) => s.requestId);
@@ -61,24 +71,49 @@ export default function CameraRig({ controls }: Props) {
 
     // End camera position = target + dir * distance
     L.endPos.copy(focusTarget).addScaledVector(dir, distance);
+    L.direction.copy(dir);
+    L.distance = distance;
+    L.followId = usePhysicsStore.getState().selectedBodyId;
   }, [requestId, camera, controls]); // ✅ ESLint is happy
 
   useFrame((_, delta) => {
-    const L = lerpRef.current;
-    if (!L.active) return;
+    const L = lerpRef.current, follow = followRef.current;
+    const selectedId = usePhysicsStore.getState().selectedBodyId;
+    const scenePosition = selectedId ? liveScenePosition(selectedId) : null;
+    const bodyPoint = scenePosition ? new THREE.Vector3(...scenePosition) : null;
 
-    // EaseOutCubic
-    L.t = Math.min(1, L.t + delta / L.duration);
-    const k = 1 - Math.pow(1 - L.t, 3);
+    if (L.active) {
+      // Chase the body's current position rather than where it was when the tween started.
+      if (bodyPoint && L.followId === selectedId) {
+        L.endTarget.copy(bodyPoint);
+        L.endPos.copy(bodyPoint).addScaledVector(L.direction, L.distance);
+      }
 
-    camera.position.lerpVectors(L.startPos, L.endPos, k);
+      // EaseOutCubic
+      L.t = Math.min(1, L.t + delta / L.duration);
+      const k = 1 - Math.pow(1 - L.t, 3);
 
-    if (controls?.target) {
-      controls.target.lerpVectors(L.startTarget, L.endTarget, k);
-      controls.update?.();
+      camera.position.lerpVectors(L.startPos, L.endPos, k);
+
+      if (controls?.target) {
+        controls.target.lerpVectors(L.startTarget, L.endTarget, k);
+        controls.update?.();
+      }
+
+      if (L.t >= 1) L.active = false;
+      follow.id = selectedId;
+      follow.last = bodyPoint;
+      return;
     }
 
-    if (L.t >= 1) L.active = false;
+    if (!bodyPoint) { follow.id = null; follow.last = null; return; }
+    if (follow.id === selectedId && follow.last) {
+      const moved = bodyPoint.clone().sub(follow.last);
+      camera.position.add(moved);
+      if (controls?.target) { controls.target.add(moved); controls.update?.(); }
+    }
+    follow.id = selectedId;
+    follow.last = bodyPoint;
   });
 
   return null;
