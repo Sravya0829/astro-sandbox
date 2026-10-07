@@ -42,3 +42,4 @@ The full plan and its rationale are in `docs/IMPLEMENTATION_PLAN.md`. Read it be
 - **Styling:** most UI styling is semantic classes in `app/globals.css`, not inline Tailwind utilities. Scene colors live in `components/canvas/sceneTheme.ts`.
 - **Definition of done** (from the plan): a feature counts as delivered only when its domain logic, worker or backend integration, UI, validation, error handling, and tests are connected. Do not ship placeholder UI.
 - No deployment or hosting actions during feature work.
+- **Git:** single-developer repo. Commit and push directly to `main`; do not create feature branches or PRs.
